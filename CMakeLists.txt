@@ -19,6 +19,13 @@ else()
   endif()
 endif()
 
+# Let the installed binaries (ss_sched, libdsa.so) locate libdsa, jsoncpp and
+# libtorch through their own RPATH, so users do not have to put the bundled
+# libtorch on LD_LIBRARY_PATH (which would shadow a Python torch install).
+set(CMAKE_INSTALL_RPATH
+  "${CMAKE_INSTALL_PREFIX}/lib;${CMAKE_INSTALL_PREFIX}/lib64;${CMAKE_SOURCE_DIR}/3rd-party/libtorch/lib")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
 # Build assumptions
 set(BUILD_SHARED_LIBS ON)
 if (DEFINED ENV{SS_TOOLS})
