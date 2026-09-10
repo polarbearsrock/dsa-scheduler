@@ -459,6 +459,29 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
           }
           // Set the control mode for this PE
           info[fu_id].ctrlMode = ctrlMode;
+          // Immediate operands: the PE has no immediate field, so the constant
+          // is preloaded into a free PE register by the bitstream (register-update
+          // group) and the operand selects that register (1 + inputs + reg).
+          for (int operIdx = 0; operIdx < (int) vertex->ops().size() && operIdx < 2; ++operIdx) {
+            if (!vertex->ops()[operIdx].isImm()) continue;
+            int numInputs = sinkFuNode->in_links().size();
+            if (info[fu_id].operandRoute.count(operIdx) && info[fu_id].operandRoute[operIdx] > numInputs) continue;
+            std::set<int> usedRegs;
+            for (auto& v : inst->values) if (v.reg != -1) usedRegs.insert(v.reg);
+            int regOper = registerOperandIndex(vertex);
+            if (regOper >= 0) usedRegs.insert(vertex->ops()[regOper].regIdx());
+            for (auto& kv : info[fu_id].regInit) usedRegs.insert(kv.first);
+            int reg = -1;
+            for (int r = 0; r < sinkFuNode->regFileSize(); ++r) if (!usedRegs.count(r)) { reg = r; break; }
+            DSA_CHECK(reg >= 0) << sinkFuNode->name() << ": no free register for the immediate operand "
+                                << operIdx << " of " << vertex->name();
+            uint64_t imm = vertex->ops()[operIdx].imm;
+            info[fu_id].operandDelay[operIdx] = 0;
+            info[fu_id].operandRoute[operIdx] = 1 + numInputs + reg;
+            info[fu_id].regInit[reg] = imm;
+            os << "//\t\tpreload register " << reg << " with immediate 0x" << std::hex << imm << std::dec
+               << " for operand " << operIdx << " (source " << 1 + numInputs + reg << ")" << endl;
+          }
           // Encode the Destination Register
           for(int resultIdx = 0; resultIdx < inst->values.size(); resultIdx++){
             if(inst->values[resultIdx].reg != -1){
@@ -516,7 +539,7 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
     for (auto& node : ssModel()->subModel()->node_list()) {
       dsa::adg::bitstream::BitstreamWriter bw(info[node->id()]);
       node->Accept(&bw);
-      configWords += bw.configBitsVec.size();
+      configWords += bw.configBitsVec.size() + bw.regUpdateVec.size();
     }
     os << endl;
     
@@ -529,6 +552,7 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
     os << "#define " << cfg_name << "_size " << configWords << std::endl;
     os << "//\tTyp|Node_ID|G|Idx|-------------- Configuration Bits --------------" << std::endl;
     os << "uint64_t " << cfg_name << "_config[" << cfg_name << "_size] = {" << std::endl;
+    std::vector<std::pair<std::string, uint64_t>> regWords;  // register preloads go last
     for (auto& node : ssModel()->subModel()->node_list()) {
       dsa::adg::bitstream::BitstreamWriter bw(info[node->id()]);
       node->Accept(&bw);
@@ -538,6 +562,11 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
         os << "\t0b" << b_config_bit // Print the binary of config bitstream
           << ", //" << node->name() << " " << config_bits << std::endl;
       }
+      for (uint64_t w : bw.regUpdateVec) regWords.emplace_back(node->name(), w);
+    }
+    for (auto& nw : regWords) {
+      std::bitset<64> b(nw.second);
+      os << "\t0b" << b << ", //" << nw.first << " register preload " << nw.second << std::endl;
     }
     os << "};";
   }

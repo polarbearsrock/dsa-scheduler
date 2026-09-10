@@ -52,6 +52,8 @@ struct NodeInfo {
   std::map<int, int> resultOutRoute{{-1, -1}};
   // Results -> Registers
   std::map<int, int> resultRegRoute{{-1, -1}};
+  // Registers preloaded with immediate operands (register index -> value)
+  std::map<int, uint64_t> regInit;
   
   // Vector of Control Lookup Table
   std::vector<ControlEntry> ctrlLUT;
@@ -336,9 +338,28 @@ struct BitstreamWriter : Visitor {
       cfgInfoBitset >>= cfgInfoBits;
       cfgIdx++;
     }
+    // Immediate operands live in PE registers. They are written through the
+    // register-update configuration group (group 1): one word per physical
+    // register of CONF_RF_MAX_BITS (32) bits, index = logical register *
+    // physical registers per register + slice. These words are emitted after
+    // every node's configuration words (see Schedule::printConfigHeader)
+    // because a configuration packet resets the register file.
+    for (auto& kv : ni.regInit) {
+      int numPhy = (fu->datawidth() + 31) / 32;
+      for (int phy = 0; phy < numPhy; ++phy) {
+        uint64_t word = (kv.second >> (32 * phy)) & 0xFFFFFFFFull;
+        word |= ((uint64_t)PE_NODE_TYPE << nodeTypeLow);
+        word |= ((uint64_t)(fu->localId()) << nodeIdLow);
+        word |= ((uint64_t)1 << cfgGroupLow);
+        word |= ((uint64_t)(kv.first * numPhy + phy) << cfgIndexLow);
+        regUpdateVec.push_back(word);
+      }
+    }
   }
 
   std::vector<uint64_t> configBitsVec;
+  // Register-update words (immediate operands), to be placed after all configuration words
+  std::vector<uint64_t> regUpdateVec;
   NodeInfo& ni;
 
   BitstreamWriter(NodeInfo& ni) : ni(ni) {}
