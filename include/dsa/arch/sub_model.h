@@ -614,6 +614,7 @@ class DataNode : public ssnode {
   int maxAbsStride2D_{1073741822};
   int readWidth_{32};
   bool streamStated_{true};
+  bool supportBuffet_{false};
   int numSpmBank_{4};
   bool indirectLength1DStream_{true};
   int maxAbsDeltaStretch2D_{1073741822};
@@ -649,6 +650,7 @@ public:
   DEF_ATTR(maxAbsStride2D);
   DEF_ATTR(readWidth);
   DEF_ATTR(streamStated);
+  DEF_ATTR(supportBuffet);
   DEF_ATTR(numSpmBank);
   DEF_ATTR(indirectLength1DStream);
   DEF_ATTR(maxAbsDeltaStretch2D);

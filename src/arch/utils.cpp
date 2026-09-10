@@ -81,7 +81,7 @@ T* SetMemoryParameters(Json::Value nodeParam, T* node) {
   int maxAbsStretch2D = nodeParam[ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D]].asInt();
   node->maxAbsStretch2D(maxAbsStretch2D);
 
-  int numMemUnitBitsExp = nodeParam[ADGKEY_NAMES[MEM_UNITBITS]].asInt();
+  int numMemUnitBitsExp = nodeParam[ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP]].asInt();
   node->numMemUnitBitsExp(numMemUnitBitsExp);
 
   int maxAbsStretch3D1D = nodeParam[ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D]].asInt();
@@ -108,6 +108,9 @@ T* SetMemoryParameters(Json::Value nodeParam, T* node) {
 
   int numSpmBank = nodeParam[ADGKEY_NAMES[MEM_NUM_SPM_BANK]].asInt();
   node->numSpmBank(numSpmBank);
+
+  bool supportBuffet = nodeParam[ADGKEY_NAMES[MEM_SUPPORT_BUFFET]].asBool();
+  node->supportBuffet(supportBuffet);
 
   bool indirectLength1DStream = nodeParam[ADGKEY_NAMES[MEM_INDIRECT_L1D]].asBool();
   node->indirectLength1DStream(indirectLength1DStream);

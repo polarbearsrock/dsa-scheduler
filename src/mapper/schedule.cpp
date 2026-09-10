@@ -281,7 +281,11 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
           // Get the output port of result
           int output_port_idx = dsa::vector_utils::indexing(currLink, sourceFuNode->out_links());
           // Since we only produce one output, let use zero for now.
-          info[fu_id].resultOutRoute[0] = output_port_idx;
+          // The hardware selects output k with value k + 1 (0 = grounded), see
+          // ProcessingElementImpl: resOutSel === (outputIdx + 1). PEs with a
+          // single output never exposed this (a one-input Mux1H ignores the
+          // select), multi-output PEs from the DSE silently dropped results.
+          info[fu_id].resultOutRoute[0] = output_port_idx + 1;
           // Write comment to header file
           os << "//\tconfig " << sourceFuNode->name() << endl
                << "//\t\troute result 0 to output port " << output_port_idx << endl;

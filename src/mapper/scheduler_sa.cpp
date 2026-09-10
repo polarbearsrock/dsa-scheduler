@@ -678,15 +678,24 @@ int SchedulerSimulatedAnnealing::routing_cost(dsa::dfg::Edge* edge,
     t_cost = sched->routing_cost(make_pair(dest_bit, link), edge);
   }
 
+  bool is_dest = (next == dest.second && dest_bit == dest.first);
+
+  // A dedicated edge may never be routed *through* a function unit that is
+  // not its destination: the bitstream encoder can only interpret a link into
+  // a PE as an operand of the instruction placed there. This check has to
+  // come before the busy-link early return below, otherwise a loaded link
+  // into a PE turns the PE into a routing hop.
+  ssfu* fu = dynamic_cast<ssfu*>(next);
+  if (fu && !is_dest && !is_temporal_inst) {
+    return -1;
+  }
+
   if (t_cost >= 2) {  // square law avoidance of existing routes
     if (!is_temporal_inst) {
       return (t_cost) * (t_cost) * 10;
     }
   }
 
-  bool is_dest = (next == dest.second && dest_bit == dest.first);
-
-  ssfu* fu = dynamic_cast<ssfu*>(next);
   if (fu && !is_dest) {
     return -1;
     t_cost += 10;
@@ -914,6 +923,14 @@ int SchedulerSimulatedAnnealing::route(
     // Set the removed link so that it can be referenced later
     removed_input_vport = {currentBit, vport->out_links()[currentLink]};
 
+    // The lane's link is hard-wired by the port. If it lands on a function
+    // unit, that unit has to be the edge's destination: a PE cannot forward a
+    // value it does not consume, and the bitstream encoder has no way to
+    // express such a hop (it crashes on a PE with no instruction).
+    if (dynamic_cast<ssfu*>(next_source.second) && next_source != dest) {
+      return 0;
+    }
+
     // Set the source bit to use when printing edge
     sched->edge_prop()[edge->id].source_bit = currentBit;
 
@@ -948,6 +965,12 @@ int SchedulerSimulatedAnnealing::route(
 
     // Set the removed link so that it can be referenced later
     removed_output_vport = {currentBit, vport->in_links()[currentLink]};
+
+    // Same rule on the output side: the port lane is wired to a fixed link, so
+    // if that link comes out of a function unit it must be the producer.
+    if (dynamic_cast<ssfu*>(next_dest.second) && next_dest != source) {
+      return 0;
+    }
 
     // Make sure that it follows granularity constraint
     if (currentBit % vport->in_links()[currentLink]->granularity() != 0) {
@@ -1392,7 +1415,10 @@ int SchedulerSimulatedAnnealing::try_candidates(
   for (auto edge : sched->operands[node->id()]) {
     auto loc = sched->locationOf(edge->def());
     if (loc.node()) {
-      src.push_back(node->id());
+      // Index the hardware distance matrix by the hardware node the operand's
+      // producer is mapped to, not by the DFG node id (which is unrelated and
+      // runs past the matrix on small fabrics).
+      src.push_back(loc.node()->id());
     }
   }
   for (auto edge : sched->users[node->id()]) {

@@ -339,13 +339,11 @@ void initialize_indirect(CodesignInstance*& ci) {
       data->indirectLength1DStream(true);
       data->indirectStride2DStream(true);
     }
-  } else {
-    for (auto data : ci->ss_model()->subModel()->data_list()) {
-      data->indirectIndexStream(false);
-      data->indirectLength1DStream(false);
-      data->indirectStride2DStream(false);
-    }
   }
+  // Otherwise keep whatever indirect support the seed ADG declares: the DFGs
+  // extracted by the compiler do not carry indirect-stream markers (indirection
+  // is a stream property decided at code generation), so the absence of an
+  // Indirect port here is not evidence that the workloads do not need it.
 }
 
 void setup_indirect(CodesignInstance*& ci, SchedulerSimulatedAnnealing*& scheduler) {

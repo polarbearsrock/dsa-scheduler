@@ -168,7 +168,10 @@ int main(int argc, char* argv[]) {
     DSA_INFO << "Running the Scheduler with ADG: " << adg_file << " and DFG: " << dfg_file;
 
     // First Create the Scheduler
-    auto scheduler = new SchedulerSimulatedAnnealing(codesign->ss_model());
+    // An over-provisioned schedule (shared links / pass-through PEs) cannot be encoded into a bitstream,
+    // so only allow it when no bitstream is requested.
+    bool allow_overprov = !dsa::ContextFlags::Global().bitstream;
+    auto scheduler = new SchedulerSimulatedAnnealing(codesign->ss_model(), "", false, false, allow_overprov);
     
     // Schedule all workloads
     bool succeed = scheduler->incrementalSchedule(*codesign);

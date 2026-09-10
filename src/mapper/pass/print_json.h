@@ -15,6 +15,15 @@ namespace dsa {
 namespace adg {
   
 
+// dsagen2 requires a vector port's depthByte to be a positive power of two
+// (or -1). The DSE tunes delay-FIFO depth in unit steps, so round up: the
+// generated hardware is then at least as deep as the scheduler assumed.
+inline int RoundUpPow2(int v) {
+  int p = 1;
+  while (p < v) p <<= 1;
+  return p;
+}
+
 inline const char * const BoolToString(bool b)
 {
   return b ? "true" : "false";
@@ -48,60 +57,16 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[COMP_OUTBUFF] << "\" : {" << std::endl;
     os << "\"" << ADGKEY_NAMES[COMP_OUTBUFF_DEPTH] << "\" : " << sw->delay_fifo_depth() << "," << std::endl;
     os << "\"parameterClassName\" : \"dsagen2.comp.config.common.CompNodeOutputBufferParameters\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[COMP_OUTBUFF_STATIC] << "\" : " << !sw->flow_control() << std::endl;
+    os << "\"" << ADGKEY_NAMES[COMP_OUTBUFF_STATIC] << "\" : " << BoolToString(!sw->flow_control()) << std::endl;
     os << "}," << std::endl;
 
     // Switch Routing
     os << "\"" << ADGKEY_NAMES[SW_ROUTE] << "\" : {" << std::endl;
-    os << "\"" << ADGKEY_NAMES[SW_ROUTE_FULLMAT] << "\" : ";
-    for (int i = 0; i < sw->in_links().size(); i++) {
-      if (i == 0)
-              os << "[ ";
-      for (int j = 0; j < sw->out_links().size(); j++) {
-        if (j == 0)
-              os << "[ ";
-        auto connectivity_matrix = sw->printableRoutingTable(i, j);
-        for (int k = 0; k < connectivity_matrix.size(); k++) {
-          if (k == 0)
-              os << "[ ";
-          
-          for (int l = 0; l < connectivity_matrix[k].size(); l++) {
-            if (l == 0)
-              os << "[ ";
-            
-            os << connectivity_matrix[k][l];
-            if (l != connectivity_matrix[k].size() - 1) {
-              os << ", ";
-            } else {
-              os << "] ";
-            }
-          }
-          
-          if (k != connectivity_matrix.size() - 1) {
-            if (connectivity_matrix[k].size() != 0) {
-              os << ", ";
-            }
-          } else {
-            os << "] ";
-          }
-        }
-
-        if (j < sw->out_links().size() - 1) {
-          if (connectivity_matrix.size() != 0) {
-            os << ", ";
-          }
-        } else {
-          os << "] ";
-        }
-
-      }
-      if (i < sw->in_links().size() - 1) {
-        os << ",";
-      } else {
-        os << "] ";
-      }
-    }
-    os << ", " << std::endl;
+    // dsagen2 reads initFullMatrix / initIndividualMatrix as bool[in][out] and
+    // treats an empty matrix as "fully connected", which is what every ADG in
+    // the repository (and the generator's own print-back) uses. The DSE never
+    // narrows intra-switch connectivity, so emit the canonical empty matrix.
+    os << "\"" << ADGKEY_NAMES[SW_ROUTE_FULLMAT] << "\" : [ ]," << std::endl;
     
     os << "\"parameterClassName\" : \"dsagen2.comp.config.switch.SWRoutingParameters\"," << std::endl;
     os << "\"" << ADGKEY_NAMES[SW_ROUTE_INDIMAT] << "\" : [ ] " << std::endl;
@@ -116,14 +81,29 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[IVP_TYPE] << "." << vport->localId() << "\" : {" << std::endl;
     os << "\"" << ADGKEY_NAMES[IVP_NODE] << "\" : {" << std::endl;
 
-    // VectorPort Parameters
-    os << "\"" << ADGKEY_NAMES[VP_IMPL] << "\" : " << 2 << "," << std::endl;
-    os << "\"" << ADGKEY_NAMES[VP_STATE] << "\" : " << BoolToString(vport->vp_stated()) << "," << std::endl;
+    // VectorPort Parameters. dsagen2 requires an input port to carry stream
+    // state when any memory feeding it supports linear padding, so honour that
+    // regardless of what the exploration decided for this port.
+    bool ivp_stated = vport->vp_stated();
+    for (auto* in_link : vport->in_links()) {
+      auto* data = dynamic_cast<DataNode*>(in_link->source());
+      if (data && data->linearPadding()) ivp_stated = true;
+    }
+    if (ivp_stated != vport->vp_stated()) {
+      // The exploration is supposed to keep such ports stated (see
+      // CodesignInstance::must_stay_stated); if it did not, the schedules were
+      // validated against a port with one more data link than the hardware.
+      DSA_WARNING << "Input vector port " << vport->name()
+                  << " is emitted as stated for linear padding, but the model explored it unstated";
+    }
+    os << "\"" << ADGKEY_NAMES[VP_IMPL] << "\" : " << vport->vp_impl() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[VP_STATE] << "\" : " << BoolToString(ivp_stated) << "," << std::endl;
     os << "\"parameterClassName\" : \"dsagen2.sync.config.IVPNodeParameters\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[DEPTH_BYTE] << "\" : " << vport->delay_fifo_depth() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[DEPTH_BYTE] << "\" : " << RoundUpPow2(vport->delay_fifo_depth()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[IVP_TYPE] << "\"," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODEID] << "\" : " << vport->localId() << "," << std::endl;
-    os << "\"" << ADGKEY_NAMES[IVP_BROADCAST] << "\" : " << vport->broadcastIVP() << std::endl;
+    os << "\"" << ADGKEY_NAMES[IVP_BROADCAST] << "\" : " << BoolToString(vport->broadcastIVP()) << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[IVP_REPEAT] << "\" : " << BoolToString(vport->repeatIVP()) << std::endl;
 
     os << "}" << std::endl;
     os << "}";
@@ -134,12 +114,12 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[OVP_NODE] << "\" : {" << std::endl;
 
     // VectorPort Parameters
-    os << "\"" << ADGKEY_NAMES[OVP_DISCARD] << "\" : " << vport->discardOVP() << "," << std::endl;
-    os << "\"" << ADGKEY_NAMES[VP_IMPL] << "\" : " << 2 << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[OVP_DISCARD] << "\" : " << BoolToString(vport->discardOVP()) << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[VP_IMPL] << "\" : " << vport->vp_impl() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[VP_STATE] << "\" : " << BoolToString(vport->vp_stated()) << "," << std::endl;
     os << "\"parameterClassName\" : \"dsagen2.sync.config.OVPNodeParameters\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[OVP_TASKFLOW] << "\" : " << vport->taskOVP() << "," << std::endl;
-    os << "\"" << ADGKEY_NAMES[DEPTH_BYTE] << "\" : " << vport->delay_fifo_depth() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[OVP_TASKFLOW] << "\" : " << BoolToString(vport->taskOVP()) << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[DEPTH_BYTE] << "\" : " << RoundUpPow2(vport->delay_fifo_depth()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[OVP_TYPE] << "\"," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODEID] << "\" : " << vport->localId() << std::endl;
 
@@ -185,7 +165,7 @@ struct JsonWriter : dsa::adg::Visitor {
     // Control Parameters
     os << "\"" << ADGKEY_NAMES[PE_CTRL] << "\" : {" << std::endl;
     os << "\"" << ADGKEY_NAMES[PE_CTRL_OUTPUT] << "\" : " << BoolToString(fu->outputCtrl()) << "," << std::endl;
-    os << "\"" << ADGKEY_NAMES[PE_CTRL_SIZE] << "\" : " << BoolToString(fu->ctrlLUTSize()) << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[PE_CTRL_SIZE] << "\" : " << fu->ctrlLUTSize() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[PE_CTRL_ABSTAIN] << "\" : " << BoolToString(fu->abstain()) << "," << std::endl;
     os << "\"parameterClassName\" : \"dsagen2.comp.config.processing_element.PEMetaCtrlParameters\"," << std::endl;
     os << "\"" << ADGKEY_NAMES[PE_CTRL_INPUT] << "\" : " << BoolToString(fu->inputCtrl()) << "," << std::endl;
@@ -258,7 +238,9 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[MEM_MAX_L2D] << "\" : " << dma->maxLength2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D] << "\" : " << dma->maxAbsStretch2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[DMA_TYPE] << "\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << dma->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << dma->numGenDataType() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP] << "\" : " << dma->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_SUPPORT_BUFFET] << "\" : " << BoolToString(dma->supportBuffet()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D] << "\" : " << dma->maxAbsStretch3D1D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_INDIRECT_INDEX] << "\" : " << BoolToString(dma->indirectIndexStream()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_NUM_STRIDE2D_UNIT_BITS_EXP] << "\" : " << dma->numStride2DUnitBitsExp() << "," << std::endl;
@@ -314,7 +296,9 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[MEM_MAX_L2D] << "\" : " << spm->maxLength2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D] << "\" : " << spm->maxAbsStretch2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[SPM_TYPE] << "\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << spm->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << spm->numGenDataType() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP] << "\" : " << spm->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_SUPPORT_BUFFET] << "\" : " << BoolToString(spm->supportBuffet()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D] << "\" : " << spm->maxAbsStretch3D1D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_INDIRECT_INDEX] << "\" : " << BoolToString(spm->indirectIndexStream()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_NUM_STRIDE2D_UNIT_BITS_EXP] << "\" : " << spm->numStride2DUnitBitsExp() << "," << std::endl;
@@ -369,7 +353,9 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[MEM_MAX_L2D] << "\" : " << rec->maxLength2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D] << "\" : " << rec->maxAbsStretch2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[REC_TYPE] << "\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << rec->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << rec->numGenDataType() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP] << "\" : " << rec->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_SUPPORT_BUFFET] << "\" : " << BoolToString(rec->supportBuffet()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D] << "\" : " << rec->maxAbsStretch3D1D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_INDIRECT_INDEX] << "\" : " << BoolToString(rec->indirectIndexStream()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_NUM_STRIDE2D_UNIT_BITS_EXP] << "\" : " << rec->numStride2DUnitBitsExp() << "," << std::endl;
@@ -424,7 +410,9 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[MEM_MAX_L2D] << "\" : " << gen->maxLength2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D] << "\" : " << gen->maxAbsStretch2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[GEN_TYPE] << "\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << gen->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << gen->numGenDataType() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP] << "\" : " << gen->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_SUPPORT_BUFFET] << "\" : " << BoolToString(gen->supportBuffet()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D] << "\" : " << gen->maxAbsStretch3D1D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_INDIRECT_INDEX] << "\" : " << BoolToString(gen->indirectIndexStream()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_NUM_STRIDE2D_UNIT_BITS_EXP] << "\" : " << gen->numStride2DUnitBitsExp() << "," << std::endl;
@@ -479,7 +467,9 @@ struct JsonWriter : dsa::adg::Visitor {
     os << "\"" << ADGKEY_NAMES[MEM_MAX_L2D] << "\" : " << reg->maxLength2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH2D] << "\" : " << reg->maxAbsStretch2D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[NODETYPE] << "\" : \"" << ADGKEY_NAMES[REG_TYPE] << "\"," << std::endl;
-    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << reg->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[NUM_MEM_DATATYPE] << "\" : " << reg->numGenDataType() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_NUM_UNITBITS_EXP] << "\" : " << reg->numMemUnitBitsExp() << "," << std::endl;
+    os << "\"" << ADGKEY_NAMES[MEM_SUPPORT_BUFFET] << "\" : " << BoolToString(reg->supportBuffet()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_MAX_ABS_STRETCH3D1D] << "\" : " << reg->maxAbsStretch3D1D() << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_INDIRECT_INDEX] << "\" : " << BoolToString(reg->indirectIndexStream()) << "," << std::endl;
     os << "\"" << ADGKEY_NAMES[MEM_NUM_STRIDE2D_UNIT_BITS_EXP] << "\" : " << reg->numStride2DUnitBitsExp() << "," << std::endl;
@@ -559,7 +549,7 @@ struct SchedWriter : dfg::Visitor {
     os << "\"VertexType\" : \"InputPort\"," << std::endl;
     
     if (adg_node) {
-      os << "\"MappedNodeId\" : \"" << ADGKEY_NAMES[IVP_TYPE] << "." <<   adg_node->id() << "\"," << std::endl;
+      os << "\"MappedNodeId\" : \"" << ADGKEY_NAMES[IVP_TYPE] << "." <<   adg_node->localId() << "\"," << std::endl;
       os << "\"MappedNodeLane\" : " << lane << std::endl; 
       os << "}" << std::endl;
     } else {
@@ -576,7 +566,7 @@ struct SchedWriter : dfg::Visitor {
     os << "\"VertexType\" : \"OutputPort\"," << std::endl;
     
     if (adg_node) {
-      os << "\"MappedNodeId\" : \"" << ADGKEY_NAMES[OVP_TYPE] << "." <<   adg_node->id() << "\"," << std::endl;
+      os << "\"MappedNodeId\" : \"" << ADGKEY_NAMES[OVP_TYPE] << "." <<   adg_node->localId() << "\"," << std::endl;
       os << "\"MappedNodeLane\" : " << lane << std::endl; 
       os << "}" << std::endl;
     } else {

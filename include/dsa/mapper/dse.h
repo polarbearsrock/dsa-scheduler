@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <map>
 #include <string>
 #include <limits>
 #include <torch/script.h>
@@ -193,7 +195,47 @@ class CodesignInstance {
   }
 
   // Check that everything is okay
+  /*!
+   * \brief The per-node link orders must admit one global connection order.
+   * dsagen2 assigns Diplomacy port indices from the order in which links are
+   * connected and derives that order from the SourceIndex/SinkIndex pairs
+   * (same source: higher index later; same sink: higher index later); if that
+   * relation has a cycle the generator rejects the ADG. Append-only mutations
+   * preserve acyclicity, positional inserts can break it.
+   */
+  void verify_link_order() {
+    auto* sub = _ssModel.subModel();
+    int n = sub->link_list().size();
+    std::vector<int> indeg(n, 0);
+    std::vector<std::vector<int>> succ(n);
+    std::set<ssnode*> nodes(sub->node_list().begin(), sub->node_list().end());
+    for (auto* data : sub->data_list()) nodes.insert(data);
+    for (auto* node : nodes) {
+      for (bool in : {false, true}) {
+        auto& links = in ? node->in_links() : node->out_links();
+        for (int i = 1; i < (int) links.size(); ++i) {
+          if (!links[i - 1] || !links[i]) continue;
+          succ[links[i - 1]->id()].push_back(links[i]->id());
+          ++indeg[links[i]->id()];
+        }
+      }
+    }
+    std::vector<int> ready;
+    for (int i = 0; i < n; ++i) if (indeg[i] == 0) ready.push_back(i);
+    int visited = 0;
+    while (!ready.empty()) {
+      int u = ready.back(); ready.pop_back(); ++visited;
+      for (int v : succ[u]) if (--indeg[v] == 0) ready.push_back(v);
+    }
+    if (visited != n) {
+      std::ostringstream os;
+      for (int i = 0; i < n; ++i) if (indeg[i] > 0) os << " " << sub->link_list()[i]->name();
+      DSA_CHECK(false) << "link connection order has a cycle (dsagen2 cannot elaborate it); links involved:" << os.str();
+    }
+  }
+
   void verify() {
+    verify_link_order();
     if (!sanity_check) return;
     
     DSA_CHECK(workload_array.size() > 0);
@@ -354,7 +396,7 @@ class CodesignInstance {
       add_link(n, ovp);
     } 
     for (auto ivp : sub->input_list()) {
-      add_link(n, ivp);
+      if (memory_feeds_inputs(n)) add_link(n, ivp);
     }
   }
 
@@ -492,7 +534,7 @@ class CodesignInstance {
       ssnode* n = sub->node_list()[i];
       if (auto sync = dynamic_cast<SyncNode*>(n)) {
         if (sync->vp_stated()) {
-          if (!stated_mapped(sync)) {
+          if (!stated_mapped(sync) && !must_stay_stated(sync)) {
             stated_collapse(sync);
           }
         }
@@ -500,6 +542,251 @@ class CodesignInstance {
     }
     while (delete_hangers()) {  }
     return false;
+  }
+
+  /*!
+   * \brief Whether a link connects a memory (data) node with a vector port.
+   * Streams are not mapped onto these links by the spatial scheduler, so link
+   * utilization never marks them as used; but the hardware generator requires
+   * every surviving vector port to keep at least one memory feeder/sink.
+   * Such links are therefore never removed while both endpoints exist.
+   */
+  /*!
+   * \brief A stated vector port reserves its first compute-side link for the
+   * stream state; no DFG edge is routed on it, so link-usage bookkeeping sees
+   * it as unused, yet removing it silently shrinks the port's capacity.
+   */
+  /*!
+   * \brief Whether a vector port has to keep its stream state in hardware.
+   * dsagen2 requires an input vector port fed by a memory that supports linear
+   * padding to be stated (padding is driven by the stream state), and the
+   * printer honours that rule. Exploration must therefore never un-state such
+   * a port, otherwise the emitted ADG has one data link less per port than
+   * the model the schedules were validated on, and the lane-to-link
+   * assignment shifts.
+   */
+  static bool must_stay_stated(SyncNode* vport) {
+    if (!vport->isInputPort()) return false;
+    for (auto* link : vport->in_links()) {
+      auto* data = dynamic_cast<DataNode*>(link->source());
+      if (data && data->linearPadding()) return true;
+    }
+    return false;
+  }
+
+  /*!
+   * \brief dsagen2 requires two output vector ports on every memory engine
+   * that supports indirect streams (the index stream is produced by an output
+   * port), so a design with indirect memories may never shrink to one OVP.
+   */
+  bool memory_supports_indirect() {
+    for (auto* data : _ssModel.subModel()->data_list()) {
+      if (data->indirectIndexStream() || data->indirectLength1DStream() ||
+          data->indirectStride2DStream())
+        return true;
+    }
+    return false;
+  }
+  int min_output_ports() { return memory_supports_indirect() ? 2 : 1; }
+
+  static bool is_stated_reserved_link(sslink* link) {
+    if (auto* ivp = dynamic_cast<ssivport*>(link->source()))
+      return ivp->vp_stated() && !ivp->out_links().empty() && ivp->out_links()[0] == link;
+    if (auto* ovp = dynamic_cast<ssovport*>(link->sink()))
+      return ovp->vp_stated() && !ovp->in_links().empty() && ovp->in_links()[0] == link;
+    return false;
+  }
+
+  static bool is_memory_port_link(sslink* link) {
+    auto* src = link->source();
+    auto* snk = link->sink();
+    bool src_data = dynamic_cast<DataNode*>(src) != nullptr;
+    bool snk_data = dynamic_cast<DataNode*>(snk) != nullptr;
+    bool src_sync = dynamic_cast<SyncNode*>(src) != nullptr;
+    bool snk_sync = dynamic_cast<SyncNode*>(snk) != nullptr;
+    return (src_data && snk_sync) || (src_sync && snk_data);
+  }
+
+  /*!
+   * \brief Connect a vector port to every memory (data) node, as the seed ADGs
+   * do. The hardware generator requires each input port to have a memory
+   * feeder and each output port a memory sink.
+   */
+  /*!
+   * \brief Whether a memory engine may feed input vector ports. dsagen2's
+   * register engine only returns output-port data to the CPU (REGImpl requires
+   * #IVP == 0), every other engine feeds inputs.
+   */
+  static bool memory_feeds_inputs(DataNode* data) { return dynamic_cast<ssregister*>(data) == nullptr; }
+
+  void connect_port_to_memory(ssivport* ivp) {
+    auto* sub = _ssModel.subModel();
+    for (auto* data : sub->data_list()) if (memory_feeds_inputs(data)) add_link(data, ivp);
+  }
+  void connect_port_to_memory(ssovport* ovp) {
+    auto* sub = _ssModel.subModel();
+    for (auto* data : sub->data_list()) add_link(ovp, data);
+  }
+
+  /*!
+   * \brief Make sure every surviving vector port still has a memory link.
+   */
+  void repair_port_memory_links() {
+    auto* sub = _ssModel.subModel();
+    for (auto* ivp : sub->input_list()) {
+      bool has_memory = false;
+      for (auto* l : ivp->in_links())
+        if (dynamic_cast<DataNode*>(l->source())) { has_memory = true; break; }
+      if (!has_memory) connect_port_to_memory(ivp);
+    }
+    for (auto* ovp : sub->output_list()) {
+      bool has_memory = false;
+      for (auto* l : ovp->out_links())
+        if (dynamic_cast<DataNode*>(l->sink())) { has_memory = true; break; }
+      if (!has_memory) connect_port_to_memory(ovp);
+    }
+  }
+
+  /*!
+   * \brief Bridge disconnected islands of the compute fabric. The hardware
+   * generator builds one reconfiguration network over all compute nodes and
+   * vector ports by walking neighbour links, so every surviving node must be
+   * reachable. Each secondary component is joined to the largest one through
+   * a bidirectional pair of links between switches (or an FU if a component
+   * has no switch); unused links are harmless to the existing schedules.
+   */
+  void repair_compute_connectivity() {
+    auto* sub = _ssModel.subModel();
+    std::vector<ssnode*> nodes;
+    for (auto* n : sub->fu_list()) nodes.push_back(n);
+    for (auto* n : sub->switch_list()) nodes.push_back(n);
+    for (auto* n : sub->input_list()) nodes.push_back(n);
+    for (auto* n : sub->output_list()) nodes.push_back(n);
+    auto is_fabric = [](ssnode* y) {
+      return y && (dynamic_cast<SpatialNode*>(y) != nullptr || dynamic_cast<SyncNode*>(y) != nullptr);
+    };
+    std::map<ssnode*, int> comp;
+    int ncomp = 0;
+    for (auto* start : nodes) {
+      if (comp.count(start)) continue;
+      std::vector<ssnode*> stack{start};
+      comp[start] = ncomp;
+      while (!stack.empty()) {
+        auto* x = stack.back();
+        stack.pop_back();
+        auto visit = [&](ssnode* y) {
+          if (is_fabric(y) && !comp.count(y)) { comp[y] = ncomp; stack.push_back(y); }
+        };
+        for (auto* l : x->in_links()) visit(l->source());
+        for (auto* l : x->out_links()) visit(l->sink());
+      }
+      ++ncomp;
+    }
+    if (ncomp <= 1) return;
+    std::vector<int> size(ncomp, 0);
+    for (auto& kv : comp) size[kv.second]++;
+    int main_c = std::max_element(size.begin(), size.end()) - size.begin();
+    auto pick = [&](int c) -> ssnode* {
+      ssnode* fallback = nullptr;
+      for (auto& kv : comp) {
+        if (kv.second != c) continue;
+        if (dynamic_cast<ssswitch*>(kv.first)) return kv.first;
+        if (!fallback && dynamic_cast<ssfu*>(kv.first)) fallback = kv.first;
+      }
+      return fallback;
+    };
+    ssnode* hub = pick(main_c);
+    bool changed = false;
+    for (int c = 0; c < ncomp; ++c) {
+      if (c == main_c) continue;
+      ssnode* other = pick(c);
+      if (!hub || !other) continue;
+      add_link(hub, other);
+      add_link(other, hub);
+      dse_changes_log.push_back("bridge disconnected compute component " + other->name());
+      changed = true;
+    }
+    if (changed) for_each_sched([&](Schedule& sched) { sched.allocate_space(); });
+  }
+
+  /*!
+   * \brief Give every vector port at least two compute-side neighbours.
+   * The hardware generator builds its reconfiguration network as a spanning
+   * tree with a small fan-out limit; a port that hangs as a single-link leaf
+   * off a switch forces that switch to parent it, and a switch with more such
+   * leaves than the fan-out limit makes the tree impossible. A second switch
+   * neighbour (as in the seed ADGs) gives the tree builder an alternative.
+   */
+  void repair_port_redundancy() {
+    auto* sub = _ssModel.subModel();
+    if (sub->switch_list().size() < 2) return;
+    auto fabric_degree = [&](ssnode* n) {
+      int d = 0;
+      for (auto* l : n->in_links()) if (!dynamic_cast<DataNode*>(l->source())) ++d;
+      for (auto* l : n->out_links()) if (!dynamic_cast<DataNode*>(l->sink())) ++d;
+      return d;
+    };
+    auto pick_switch = [&](ssnode* port, bool port_is_input) -> ssswitch* {
+      ssswitch* best = nullptr;
+      int best_degree = 1 << 30;
+      for (auto* sw : sub->switch_list()) {
+        bool adjacent = false;
+        for (auto* l : port->out_links()) if (l->sink() == sw) adjacent = true;
+        for (auto* l : port->in_links()) if (l->source() == sw) adjacent = true;
+        if (adjacent) continue;
+        int d = fabric_degree(sw);
+        if (d < best_degree) { best_degree = d; best = sw; }
+      }
+      return best;
+    };
+    bool changed = false;
+    for (auto* ivp : sub->input_list()) {
+      if (fabric_degree(ivp) >= 2) continue;
+      if (auto* sw = pick_switch(ivp, true)) { add_link(ivp, sw); changed = true; }
+    }
+    for (auto* ovp : sub->output_list()) {
+      if (fabric_degree(ovp) >= 2) continue;
+      if (auto* sw = pick_switch(ovp, false)) { add_link(sw, ovp); changed = true; }
+    }
+    // dsagen2 requires an input-controlled PE to have at least two inputs
+    // (PEFuncUnitInst: "You support input control, but you only have 1
+    // inputs"); pruning can leave a PE with a single input link.
+    for (auto* fu : sub->fu_list()) {
+      if (!fu->inputCtrl() || fu->in_links().size() >= 2) continue;
+      if (auto* sw = pick_switch(fu, true)) { add_link(sw, fu); changed = true; }
+    }
+    if (changed) {
+      dse_changes_log.push_back("add second switch neighbour to leaf vector ports");
+      for_each_sched([&](Schedule& sched) { sched.allocate_space(); });
+    }
+  }
+
+  /*!
+   * \brief Newly created switches/FUs start from the model defaults (8-bit
+   * granularity, 15-deep buffers), which do not match the fabric they join and
+   * make the hardware generator fail on mismatched datapath bundles. Copy the
+   * datapath parameters from an existing fabric node instead.
+   */
+  void inherit_fabric_parameters(ssnode* node) {
+    auto* sub = _ssModel.subModel();
+    ssnode* tmpl = nullptr;
+    for (auto* sw : sub->switch_list()) if (sw != node) { tmpl = sw; break; }
+    if (!tmpl) for (auto* fu : sub->fu_list()) if (fu != node) { tmpl = fu; break; }
+    if (!tmpl) return;
+    node->datawidth(tmpl->datawidth());
+    node->granularity(tmpl->granularity());
+    node->flow_control(tmpl->flow_control());
+    node->max_delay(tmpl->max_delay());
+  }
+  ssswitch* add_switch_like_fabric() {
+    ssswitch* sw = _ssModel.subModel()->add_switch();
+    inherit_fabric_parameters(sw);
+    return sw;
+  }
+  ssfu* add_fu_like_fabric() {
+    ssfu* fu = _ssModel.subModel()->add_fu();
+    inherit_fabric_parameters(fu);
+    return fu;
   }
 
   void prune_all_unused() {
@@ -522,10 +809,81 @@ class CodesignInstance {
     std::vector<ssnode*> nodes_to_delete;
     std::vector<sslink*> links_to_delete;
 
+    // Links and nodes that are unused by every schedule but must survive the
+    // prune anyway, because the hardware needs them.
+    std::set<sslink*> keep_links;
+    std::set<ssnode*> keep_nodes;
+    auto is_data = [](ssnode* n) { return dynamic_cast<DataNode*>(n) != nullptr; };
+    auto link_survives = [&](sslink* l) {
+      return !unused_links[l->id()] || is_memory_port_link(l) || is_stated_reserved_link(l) || keep_links.count(l);
+    };
+    auto node_survives = [&](ssnode* n) {
+      return !unused_nodes[n->id()] || is_data(n) || keep_nodes.count(n);
+    };
+    // Keep an unused node alive without turning it into a hanger: it needs one
+    // compute-side out-link to a node that survives, recursively.
+    std::vector<ssnode*> chain;
+    auto keep_alive = [&](ssnode* n) {
+      if (node_survives(n)) return;
+      keep_nodes.insert(n);
+      chain.push_back(n);
+    };
+    auto settle_chain = [&]() {
+      while (!chain.empty()) {
+        ssnode* n = chain.back(); chain.pop_back();
+        if (dynamic_cast<ssovport*>(n)) continue;  // memory links are its outputs
+        bool has_out = false;
+        for (auto* l : n->out_links()) if (!is_data(l->sink()) && link_survives(l)) has_out = true;
+        if (has_out) continue;
+        sslink* best = nullptr;
+        for (auto* l : n->out_links()) if (!is_data(l->sink()) && node_survives(l->sink())) { best = l; break; }
+        if (!best) for (auto* l : n->out_links()) if (!is_data(l->sink())) { best = l; break; }
+        if (!best) continue;
+        keep_links.insert(best);
+        keep_alive(best->sink());
+      }
+    };
+
+    // 1. A stated port's reserved link (never pruned, see is_stated_reserved
+    //    link) lands on a node that may be unused otherwise; deleting that node
+    //    as a hanger would take the reserved link, and the port's schedule,
+    //    with it.
+    for (auto* ivp : sub->input_list()) {
+      if (ivp->vp_stated() && !ivp->out_links().empty()) keep_alive(ivp->out_links()[0]->sink());
+    }
+    settle_chain();
+
+    // 2. Indirect-capable memories need two output vector ports in hardware
+    //    (see min_output_ports); if the schedules use fewer, retain one unused
+    //    OVP together with one compute-side link from a node that survives.
+    if (min_output_ports() > 1) {
+      int used_ovps = 0;
+      for (auto* ovp : sub->output_list()) used_ovps += !unused_nodes[ovp->id()];
+      if (used_ovps < min_output_ports()) {
+        ssovport* spare_ovp = nullptr;
+        sslink* spare_link = nullptr;
+        for (auto* ovp : sub->output_list()) {
+          if (!unused_nodes[ovp->id()]) continue;
+          for (auto* l : ovp->in_links()) {
+            if (!is_data(l->source()) && node_survives(l->source())) { spare_ovp = ovp; spare_link = l; break; }
+          }
+          if (spare_ovp) break;
+        }
+        if (!spare_ovp) {
+          for (auto* ovp : sub->output_list()) if (unused_nodes[ovp->id()]) { spare_ovp = ovp; break; }
+        }
+        if (spare_ovp) {
+          keep_nodes.insert(spare_ovp);
+          if (spare_link) keep_links.insert(spare_link);
+          dse_changes_log.push_back("retain " + spare_ovp->name() + " for indirect streams");
+        }
+      }
+    }
+
     // Add all links that are unused to a vector then delete them
     // Note: Links must be deleted before nodes
     for (int i = 0; i < unused_links.size(); i++) {
-      if (unused_links[i])
+      if (!link_survives(sub->link_list()[i]))
         links_to_delete.push_back(sub->link_list()[i]);
     }
 
@@ -533,18 +891,89 @@ class CodesignInstance {
       delete_link(link, false);
     }
 
-    // Add all nodes that are unused to a vector then delete them
+    // Add all nodes that are unused to a vector then delete them.
+    // The DMA and scratchpad engines are the accelerator's memory interface
+    // and must survive even when no schedule marks them as used (DFGs without
+    // array annotations carry no memory vertices at all); without them the
+    // generated hardware cannot stream any data.
     for (int i = 0; i < unused_nodes.size(); i++) {
-      if (unused_nodes[i])
-        nodes_to_delete.push_back(sub->node_list()[i]);
+      ssnode* n = sub->node_list()[i];
+      // Memory engines are never pruned: besides DMA/SPM, the ISA needs the
+      // register engine for ss_recv (scalar read-back), the generate engine
+      // for constant streams and the recurrence engine for ss_rec, none of
+      // which is visible in the extracted DFGs.
+      if (unused_nodes[i] && !keep_nodes.count(n) && !dynamic_cast<DataNode*>(n))
+        nodes_to_delete.push_back(n);
     }
 
     for (auto node : nodes_to_delete) {
       delete_node(node, false, false, false);
     }
+
+    // A retained OVP must not be a hanger: give it a compute-side link if it
+    // has none (repair_port_redundancy adds the second one).
+    for (auto* n : keep_nodes) {
+      if (auto* ovp = dynamic_cast<ssovport*>(n)) {
+        bool has_compute_link = false;
+        for (auto* l : ovp->in_links()) if (!is_data(l->source())) has_compute_link = true;
+        if (!has_compute_link && !sub->switch_list().empty()) add_link(sub->switch_list()[0], ovp);
+      }
+    }
     
     while (delete_hangers()) {  }
+    repair_port_memory_links();
+    repair_compute_connectivity();
+    ensure_output_ports();
+    repair_port_redundancy();
     return;
+  }
+
+  /*!
+   * \brief Exploration can lose output ports through hanger deletion, so the
+   * two-OVP rule for indirect memories (min_output_ports) is enforced on the
+   * final design: missing ports are created next to an existing one.
+   */
+  static void copy_port_kind(ssivport* vport, ssivport* tmpl) {
+    vport->repeatIVP(tmpl->repeatIVP());
+    vport->broadcastIVP(tmpl->broadcastIVP());
+  }
+  static void copy_port_kind(ssovport* vport, ssovport* tmpl) {
+    vport->discardOVP(tmpl->discardOVP());
+    vport->taskOVP(tmpl->taskOVP());
+  }
+  // A port created during exploration must look like the ports of the seed:
+  // the model's defaults (crossbar implementation, no repeat/broadcast, 16-deep
+  // FIFO) describe hardware the bitstream encoder never configures, and the
+  // compiler relies on repeat ports for scalars reused across a stream.
+  template <typename VP>
+  static void clone_port_attributes(VP* vport, const std::vector<VP*>& ports) {
+    VP* tmpl = nullptr;
+    for (VP* p : ports) if (p != vport) { tmpl = p; break; }
+    if (!tmpl) return;
+    vport->datawidth(tmpl->datawidth());
+    vport->granularity(tmpl->granularity());
+    vport->max_util(tmpl->max_util());
+    vport->flow_control(tmpl->flow_control());
+    vport->max_delay(tmpl->max_delay());
+    vport->vp_impl(tmpl->vp_impl());
+    vport->vp_stated(tmpl->vp_stated());
+    copy_port_kind(vport, tmpl);
+  }
+
+  void ensure_output_ports() {
+    auto* sub = _ssModel.subModel();
+    while ((int) sub->output_list().size() < min_output_ports()) {
+      ssovport* ovp = sub->add_output_vport();
+      clone_port_attributes(ovp, sub->output_list());
+      ovp->vp_stated(false);
+      connect_port_to_memory(ovp);
+      ssnode* src = nullptr;
+      if (!sub->switch_list().empty()) src = sub->switch_list()[0];
+      else if (!sub->fu_list().empty()) src = sub->fu_list()[0];
+      if (src) add_link(src, ovp);
+      for_each_sched([&](Schedule& sched) { sched.allocate_space(); });
+      dse_changes_log.push_back("add " + ovp->name() + " for indirect streams");
+    }
   }
 
   void make_random_modification(double temperature) {
@@ -624,27 +1053,36 @@ class CodesignInstance {
 
       s << "add link from " << src->name() << " to " << dst->name();
     } else if (item_class < 65) { // 10% to add a random switch
-      ssswitch* sw = sub->add_switch();
+      ssswitch* sw = add_switch_like_fabric();
       add_random_edges_to_node(sw, 1, 5, 1, 5);
       s << "add switch " <<  sw->name() << " ins/outs: " << sw->in_links().size() << "/" << sw->out_links().size();
     } else if (item_class < 75) { // 10% to add a random FU
       // Randomly pick an FU type from the set
       auto& fu_defs = _ssModel.fu_types;
       if (fu_defs.empty()) return false;
-      ssfu* fu = sub->add_fu();
+      ssfu* fu = add_fu_like_fabric();
       int fu_def_index = rand() % fu_defs.size();
       Capability* def = fu_defs[fu_def_index];
       fu->fu_type(*def);
       s << "add function unit " << fu->name();
     } else if (item_class < 85) { //  10% to add a random input vector port
       ssivport* vport = sub->add_input_vport();
+      clone_port_attributes(vport, sub->input_list());
+      connect_port_to_memory(vport);
       add_random_edges_to_node(vport, 0, 1, 5, 12);
       s << "adding input vport " << vport->name();
     } else if (item_class < 95) { // 10% to add a random output vector port
       ssovport* vport = sub->add_output_vport();
+      clone_port_attributes(vport, sub->output_list());
+      connect_port_to_memory(vport);
       add_random_edges_to_node(vport, 5, 12, 0, 1);
       s << "adding output vport " << vport->name();
     } else { // 5% to add a scratchpad
+      // Disabled: a new scratchpad gets the model's default parameters, which
+      // the hardware generator rejects next to the seed's memory nodes (e.g. a
+      // constant-stream data type on a node that does not support generated
+      // streams). Re-enable once new memory nodes clone an existing one.
+      return false;
       ssscratchpad* spm = sub->add_scratchpad();
       add_edges_to_data_node(spm);
       s << "adding scratchpad " << spm->name();
@@ -677,6 +1115,12 @@ class CodesignInstance {
       if (sub->link_list().empty()) return false;
       int index = non_uniform_random(sub->link_list(), unused_links);
       sslink* l = sub->link_list()[index];
+      if (is_memory_port_link(l)) return false;  // structural, see is_memory_port_link
+      if (is_stated_reserved_link(l)) return false;  // reserved for stream state
+      if (auto* ivp = dynamic_cast<ssivport*>(l->source())) {
+        // hardware needs one state link plus at least one data link
+        if (must_stay_stated(ivp) && ivp->out_links().size() <= 2) return false;
+      }
       s << "remove link " << l->name();
       dse_changes_log.push_back(s.str());
       delete_link(l);
@@ -702,7 +1146,7 @@ class CodesignInstance {
       dse_changes_log.push_back(s.str());
       delete_node(vport, false, false, false);
     } else if (item_class < 90) { // 5% to remove a random output vector port
-      if (sub->output_list().size() <= 1) return false;
+      if ((int) sub->output_list().size() <= min_output_ports()) return false;
       int index = non_uniform_random(sub->output_list(), unused_nodes);
       ssovport* vport = sub->output_list()[index];
       s << "remove output vport "<< vport->name();
@@ -712,6 +1156,11 @@ class CodesignInstance {
       if (sub->data_list().empty()) return false;
       int index = non_uniform_random(sub->data_list(), unused_nodes);
       DataNode* mem = sub->data_list()[index];
+      // Memory engines are the accelerator's interface to the ISA (DMA/SPM
+      // for streams, register engine for ss_recv, generate engine for
+      // constant streams, recurrence engine for ss_rec); the DFGs do not show
+      // which ones the kernels need, so none of them is ever removed.
+      return false;
       s << "remove memory " << mem->name();
       dse_changes_log.push_back(s.str());
       delete_node(mem, false, false, false);
@@ -744,6 +1193,13 @@ class CodesignInstance {
       int node_index = rand() % sub->node_list().size();
       ssnode* node = sub->node_list()[node_index];
       if (dynamic_cast<SyncNode*>(node)) return false;
+      // Flow control is not explored: a static switch output register ignores
+      // downstream ready (NBufferImpl: input.ready := true), so data is lost
+      // whenever a dynamic PE or vector port stalls, and static PEs with a
+      // register file elaborate into a combinational loop. The scheduler only
+      // models dynamic behaviour for control-dependent nodes, so a mixed
+      // static/dynamic fabric is not something it can schedule safely.
+      return false;
       s << "change Node " << node->name() << " flow control from " << node->flow_control() << " to " << !node->flow_control();
 
       node->flow_control(!node->flow_control());
@@ -984,6 +1440,7 @@ class CodesignInstance {
       auto vport = sub->input_list()[index];
 
       if (vport->out_links().size() < 2) return false;
+      if (vport->vp_stated() && must_stay_stated(vport)) return false;
 
       if (vport->vp_stated()) {
         stated_collapse(vport);
@@ -1027,6 +1484,11 @@ class CodesignInstance {
       dma->readWidth(std::pow(2, bus_width));
       dma->writeWidth(std::pow(2, bus_width));
     } else if (item_class < 95) { // 10% to change scratchpad bus size
+      // Disabled like the system-bus mutation above: an overlay whose
+      // scratchpad bus was narrowed to 8 B computed wrong results on RTL even
+      // for DMA-only kernels (memory-side vector port datapath), while the
+      // same overlay with the seed's 32 B bus passed all four kernels.
+      return false;
       if  (sub->scratch_list().empty()) return false;
       int index = rand() % sub->scratch_list().size();
       auto spm = sub->scratch_list()[index];
@@ -1331,7 +1793,7 @@ class CodesignInstance {
   void check_stated(ssnode* node) {
     if (auto vport = dynamic_cast<SyncNode*>(node)) {
       bool prev_stated = vport->vp_stated();
-      if (vport->isInputPort() && vport->out_links().size() < 2) {
+      if (vport->isInputPort() && vport->out_links().size() < 2 && !must_stay_stated(vport)) {
         vport->vp_stated(false);
       }
       if (vport->isOutputPort() && vport->in_links().size() < 2) {
@@ -1348,6 +1810,9 @@ class CodesignInstance {
    */
   sslink* add_link(ssnode* source, ssnode* sink, int souceSlot=-1, int sinkSlot=-1) {
     auto* sub = _ssModel.subModel();
+    // The register engine never feeds input ports (see memory_feeds_inputs);
+    // random link mutations must not create such a link either.
+    if (dynamic_cast<ssregister*>(source) && dynamic_cast<ssivport*>(sink)) return nullptr;
     auto* link = sub->add_link(source, sink, souceSlot, sinkSlot);
     return link;
   }
@@ -1528,7 +1993,15 @@ class CodesignInstance {
     double performance = -1;
 
     // Now we should calculate system-level parameters
-    std::vector<int> possible_system_bus = {8, 16, 32, 64};
+    // The system bus width is not explored: configuration_performance() used to
+    // leave the DMA at the last trial width (64 B), and any width other than the
+    // seed's 32 B corrupts stream data on the generated RTL (8 B scratchpad bus,
+    // 64 B DMA bus both observed). Keep whatever the seed specifies.
+    std::vector<int> possible_system_bus = {32};
+    {
+      auto dma = _ssModel.subModel()->dma_list();
+      if (!dma.empty()) possible_system_bus = {dma[0]->readWidth()};
+    }
 
     for (int system_bus_width_local : possible_system_bus) {
       // Setup resource estimation
@@ -1964,7 +2437,7 @@ class CodesignInstance {
           for (auto& link : other_vport->in_links()) {
             if (links.size() > 0) {
               auto link_to_add = links.begin();
-              ssswitch* sw = sub->add_switch();
+              ssswitch* sw = add_switch_like_fabric();
               sub->add_link(sw, other_vport);
               sub->add_link(link->source(), sw);
               sub->add_link((* link_to_add)->source(), sw);
@@ -1975,7 +2448,7 @@ class CodesignInstance {
         } else {
           // First add
           for (auto& link : other_vport->in_links()) {
-            ssswitch* sw = sub->add_switch();
+            ssswitch* sw = add_switch_like_fabric();
             sub->add_link(sw, other_vport);
             sub->add_link(link->source(), sw);
             delete_link(link);
@@ -2009,7 +2482,7 @@ class CodesignInstance {
           for (auto& link : other_vport->out_links()) {
             if (links.size() > 0) {
               auto link_to_add = links.begin();
-              ssswitch* sw = sub->add_switch();
+              ssswitch* sw = add_switch_like_fabric();
               sub->add_link(other_vport, sw);
               sub->add_link(sw, link->sink());
               sub->add_link(sw, (* link_to_add)->sink());
@@ -2020,7 +2493,7 @@ class CodesignInstance {
         } else {
           // First add
           for (auto& link : other_vport->out_links()) {
-            ssswitch* sw = sub->add_switch();
+            ssswitch* sw = add_switch_like_fabric();
             sub->add_link(sw, other_vport);
             sub->add_link(sw, link->sink());
             delete_link(link);
@@ -2082,11 +2555,12 @@ class CodesignInstance {
       //Check if link is the node to collapse
       if (link->sink()->id() == n->id() && i + 1 < links.size()) {
         auto src = link->source();
-        int sourceIndex = src->link_index(link, false);
         sslink* next_link  = links[i + 1].second;
         auto dst = next_link->sink();
-        int sinkIndex = dst->link_index(next_link, true);
-        sslink* collapsed_link = add_link(src, dst, sourceIndex, sinkIndex);
+        // Append the bypass link: inserting it at the positions of the two
+        // links it replaces gives it two different "creation times", which
+        // breaks the per-node link order dsagen2 derives port indices from.
+        sslink* collapsed_link = add_link(src, dst);
 
         // Repair Schedule
         
@@ -2115,14 +2589,11 @@ class CodesignInstance {
           DSA_LOG(COLLAPSE) << "Collapsing node " << n->name() << " with link " << link.second->name() << " and link " << edge.links[j + 1].second->name() << " on edge " << i;
           
           ssnode* src = link.second->source();
-          int src_slot = link.first;
-          int sourceIndex = src->link_index(link.second, false);
           auto next_link  = edge.links[j + 1];
-
           ssnode* dst = next_link.second->sink();
-          int dst_slot = edge.links[j + 1].first;
-          int sinkIndex = dst->link_index(next_link.second, true);
-          sslink* collapsed_link = add_link(src, dst, sourceIndex, sinkIndex);
+          // See collapse_edge_links: the bypass link is appended, not
+          // inserted at the replaced links' positions.
+          sslink* collapsed_link = add_link(src, dst);
           if (collapsed_link == nullptr)
             continue;
 
@@ -2168,7 +2639,7 @@ class CodesignInstance {
   void stated_collapse(ssnode* n) {
     auto* sub = _ssModel.subModel();
     if (auto sync = dynamic_cast<SyncNode*>(n)) {
-      if (sync->vp_stated()) {
+      if (sync->vp_stated() && !must_stay_stated(sync)) {
         // Change VP_Stated to false
         sync->vp_stated(false);
         

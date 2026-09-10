@@ -168,7 +168,7 @@ MACRO(MEM_UNITBITS, memUnitBits)                                // Parameter: ui
                                                                 //  DIS: SupportedMinimumStreamDataType
                                                                 //  GEN: SupportedMinimumStreamDataType
                                                                 //  REG: XLEN
-MACRO(NUM_MEM_DATATYPE, numMemDataTypeExp)                      // Parameter: uint, number of memory data type supported
+MACRO(NUM_MEM_DATATYPE, numGenDataType)                      // Parameter: uint, number of memory data type supported
                                                                 /**
                                                                  * This is purely defined by users. For example, if memUnitBits = 8, numMemUnitBitsExp 4.
                                                                  * It means that we support byte/half-word/word/double-word in total four kinds of stream.
@@ -209,7 +209,9 @@ MACRO(MEM_ATOMIC_OP, AtomicOperations)                          // Parameter: st
                                                                 //  Mul, Div, Mod, Min, Max, BNot, BOr, BAnd, BXor, LNot, 
                                                                 //  LAnd, LOr, LXor, Comp
 MACRO(MEM_NUM_STRIDE2D_UNIT_BITS_EXP, NumStride2DUnitBitsExp)                          // Parameter: uint, Number of data type for stride2D stream
-MACRO(MEM_NUM_PENDING_REQUEST, NumPendingRequest)               // Parameter: uint, Number of ROB Entry, DMA and Indirect SPM and GEN only
+MACRO(MEM_NUM_PENDING_REQUEST, numPendingRequest)               // Parameter: uint, Number of ROB Entry, DMA and Indirect SPM and GEN only
 MACRO(MEM_NUM_L1DUNITBITSEXP, NumLength1DUnitBitsExp)           // Parameter: uint, Number of data type for Linear1D stream
 MACRO(MEM_NUM_IDXUNITBITSEXP, NumIdxUnitBitsExp)                // Parameter: uint, Number of data type for index stream
-MACRO(MEM_NUM_SPM_BANK, NumSpmBank)                             // Parameter: uint, Number of Scratchpad Memory Bank
+MACRO(MEM_NUM_SPM_BANK, numSpmBank)                             // Parameter: uint, Number of Scratchpad Memory Bank
+MACRO(MEM_NUM_UNITBITS_EXP, numMemUnitBitsExp)                  // Parameter: uint, number of memory data types supported, as exponent (dsagen2 key)
+MACRO(MEM_SUPPORT_BUFFET, supportBuffet)                         // Parameter: bool, true if the memory node supports buffet streams (dsagen2 key)
