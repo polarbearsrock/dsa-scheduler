@@ -151,6 +151,27 @@ int registerOperandIndex(dfg::Node *node) {
   return -1;
 }
 
+int Schedule::registerDemand(ssfu* fu, dfg::Instruction* extra) {
+  std::set<dfg::Instruction*> insts;
+  for (int slot = 0; slot < fu->lanes(); ++slot) {
+    for (auto& kv : dfg_nodes_of(slot, fu)) {
+      if (auto* inst = dynamic_cast<dfg::Instruction*>(kv.first)) insts.insert(inst);
+    }
+  }
+  if (extra) insts.insert(extra);
+  std::set<int> fixed;
+  std::set<uint64_t> immediates;  // equal immediates share one preloaded register
+  for (auto* inst : insts) {
+    for (auto& v : inst->values) if (v.reg != -1) fixed.insert(v.reg);
+    int regOper = registerOperandIndex(inst);
+    if (regOper >= 0) fixed.insert(inst->ops()[regOper].regIdx());
+    for (int k = 0; k < (int) inst->ops().size() && k < 2; ++k) {
+      if (inst->ops()[k].isImm()) immediates.insert(inst->ops()[k].imm);
+    }
+  }
+  return (int) fixed.size() + (int) immediates.size();
+}
+
 // Write to a header file
 void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_cheat) {
   DSA_INFO << cfg_name << ": bitstream is being generated";
@@ -466,16 +487,28 @@ void Schedule::printConfigHeader(ostream& os, std::string cfg_name, bool use_che
             if (!vertex->ops()[operIdx].isImm()) continue;
             int numInputs = sinkFuNode->in_links().size();
             if (info[fu_id].operandRoute.count(operIdx) && info[fu_id].operandRoute[operIdx] > numInputs) continue;
+            // Registers already claimed on this PE: accumulators and register operands of
+            // every instruction mapped here, plus immediates preloaded so far.
             std::set<int> usedRegs;
-            for (auto& v : inst->values) if (v.reg != -1) usedRegs.insert(v.reg);
-            int regOper = registerOperandIndex(vertex);
-            if (regOper >= 0) usedRegs.insert(vertex->ops()[regOper].regIdx());
+            for (int slot = 0; slot < sinkFuNode->lanes(); ++slot) {
+              for (auto& kv : dfg_nodes_of(slot, sinkFuNode)) {
+                auto* other = dynamic_cast<dfg::Instruction*>(kv.first);
+                if (!other) continue;
+                for (auto& v : other->values) if (v.reg != -1) usedRegs.insert(v.reg);
+                int otherReg = registerOperandIndex(other);
+                if (otherReg >= 0) usedRegs.insert(other->ops()[otherReg].regIdx());
+              }
+            }
             for (auto& kv : info[fu_id].regInit) usedRegs.insert(kv.first);
-            int reg = -1;
-            for (int r = 0; r < sinkFuNode->regFileSize(); ++r) if (!usedRegs.count(r)) { reg = r; break; }
-            DSA_CHECK(reg >= 0) << sinkFuNode->name() << ": no free register for the immediate operand "
-                                << operIdx << " of " << vertex->name();
             uint64_t imm = vertex->ops()[operIdx].imm;
+            int reg = -1;
+            // Reuse a register already preloaded with the same value on this PE.
+            for (auto& kv : info[fu_id].regInit) if (kv.second == imm) { reg = kv.first; break; }
+            for (int r = 0; reg < 0 && r < sinkFuNode->regFileSize(); ++r) if (!usedRegs.count(r)) reg = r;
+            DSA_CHECK(reg >= 0) << sinkFuNode->name() << ": no free register for the immediate operand "
+                                << operIdx << " of " << vertex->name() << " (demand "
+                                << registerDemand(sinkFuNode, nullptr) << " > " << sinkFuNode->regFileSize()
+                                << " registers; the scheduler's candidate filter should prevent this)";
             info[fu_id].operandDelay[operIdx] = 0;
             info[fu_id].operandRoute[operIdx] = 1 + numInputs + reg;
             info[fu_id].regInit[reg] = imm;

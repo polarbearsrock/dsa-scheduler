@@ -128,6 +128,13 @@ struct CandidateSpotVisitor : dfg::Visitor {
         continue;
       }
 
+      // Immediates are preloaded into PE registers by the bitstream, so the PE must have
+      // enough registers for every instruction mapped on it (see Schedule::registerDemand).
+      if (sched->registerDemand(cand_fu, inst) > cand_fu->regFileSize()) {
+        DSA_LOG(CAND) << "Not enough PE registers: " << cand_fu->name() << " " << inst->name();
+        continue;
+      }
+
       if (!inst->is_temporal()) {
         if (sched->isPassthrough(0, cand_fu))  {// FIXME -- this can't be right
           DSA_LOG(CAND) << "Used as Passthrough";

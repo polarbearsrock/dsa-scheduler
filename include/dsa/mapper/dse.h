@@ -566,7 +566,10 @@ class CodesignInstance {
    * assignment shifts.
    */
   static bool must_stay_stated(SyncNode* vport) {
-    if (!vport->isInputPort()) return false;
+    // Output ports always keep their stream-state link: the seed's OVPs are all
+    // stated, and every DSE overlay with unstated OVPs lost output vectors on
+    // RTL (matadd every other vector, solver corrupted) while stated ones passed.
+    if (!vport->isInputPort()) return true;
     for (auto* link : vport->in_links()) {
       auto* data = dynamic_cast<DataNode*>(link->source());
       if (data && data->linearPadding()) return true;
@@ -851,6 +854,9 @@ class CodesignInstance {
     for (auto* ivp : sub->input_list()) {
       if (ivp->vp_stated() && !ivp->out_links().empty()) keep_alive(ivp->out_links()[0]->sink());
     }
+    for (auto* ovp : sub->output_list()) {
+      if (ovp->vp_stated() && !ovp->in_links().empty()) keep_alive(ovp->in_links()[0]->source());
+    }
     settle_chain();
 
     // 2. Indirect-capable memories need two output vector ports in hardware
@@ -965,12 +971,16 @@ class CodesignInstance {
     while ((int) sub->output_list().size() < min_output_ports()) {
       ssovport* ovp = sub->add_output_vport();
       clone_port_attributes(ovp, sub->output_list());
-      ovp->vp_stated(false);
       connect_port_to_memory(ovp);
-      ssnode* src = nullptr;
-      if (!sub->switch_list().empty()) src = sub->switch_list()[0];
-      else if (!sub->fu_list().empty()) src = sub->fu_list()[0];
-      if (src) add_link(src, ovp);
+      // a stated port needs its state link (first) plus at least one data link
+      int wanted = ovp->vp_stated() ? 2 : 1;
+      for (int k = 0; k < wanted; ++k) {
+        ssnode* src = nullptr;
+        if ((int) sub->switch_list().size() > k) src = sub->switch_list()[k];
+        else if (!sub->switch_list().empty()) src = sub->switch_list()[0];
+        else if (!sub->fu_list().empty()) src = sub->fu_list()[0];
+        if (src) add_link(src, ovp);
+      }
       for_each_sched([&](Schedule& sched) { sched.allocate_space(); });
       dse_changes_log.push_back("add " + ovp->name() + " for indirect streams");
     }
@@ -1120,6 +1130,9 @@ class CodesignInstance {
       if (auto* ivp = dynamic_cast<ssivport*>(l->source())) {
         // hardware needs one state link plus at least one data link
         if (must_stay_stated(ivp) && ivp->out_links().size() <= 2) return false;
+      }
+      if (auto* ovp = dynamic_cast<ssovport*>(l->sink())) {
+        if (must_stay_stated(ovp) && ovp->in_links().size() <= 2) return false;
       }
       s << "remove link " << l->name();
       dse_changes_log.push_back(s.str());
@@ -1511,12 +1524,8 @@ class CodesignInstance {
       auto vport = sub->output_list()[index];
 
       if (vport->in_links().size() < 2) return false;
-
-      if (vport->vp_stated()) {
-        stated_collapse(vport);
-      } else {
-        vport->vp_stated(true);
-      }
+      if (vport->vp_stated()) return false;  // output ports stay stated (see must_stay_stated)
+      vport->vp_stated(true);
       unassign_node(vport);
 
       s << "change Output vport " << vport->name() << " state from " << !vport->vp_stated() << " to " << vport->vp_stated();

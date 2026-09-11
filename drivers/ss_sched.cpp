@@ -173,8 +173,48 @@ int main(int argc, char* argv[]) {
     bool allow_overprov = !dsa::ContextFlags::Global().bitstream;
     auto scheduler = new SchedulerSimulatedAnnealing(codesign->ss_model(), "", false, false, allow_overprov);
     
-    // Schedule all workloads
-    bool succeed = scheduler->incrementalSchedule(*codesign);
+    // Reproducible builds: with DSA_MAPPING_DIR set, a mapping saved by an
+    // earlier run for the same DFG and the same ADG contents is loaded instead
+    // of annealing again (the annealer is not reproducible even with a fixed
+    // seed), and a new mapping is saved after a successful anneal.
+    const char* mapdir = getenv("DSA_MAPPING_DIR");
+    auto file_base = [](const std::string& path) {
+      auto f = path.substr(path.find_last_of('/') + 1);
+      return f.substr(0, f.find_last_of('.'));
+    };
+    std::string adg_key;
+    if (mapdir) {
+      std::ifstream af(adg_file);
+      std::stringstream ab; ab << af.rdbuf();
+      adg_key = file_base(adg_file) + "." + std::to_string(std::hash<std::string>{}(ab.str()) % 1000000007);
+    }
+    auto mapping_path = [&](Schedule& s) {
+      return std::string(mapdir) + "/" + file_base(s.ssdfg()->filename) + "." + adg_key + ".mapping.json";
+    };
+    bool loaded = false;
+    if (mapdir) {
+      loaded = true;
+      for (auto& ws : codesign->workload_array) {
+        for (auto& s : ws.sched_array) {
+          std::ifstream f(mapping_path(s));
+          if (!f.good()) { loaded = false; break; }
+          s.LoadMappingInJson(mapping_path(s));
+          if (!s.is_complete<dsa::dfg::Node*>()) { loaded = false; break; }
+          DSA_INFO << "Loaded mapping " << mapping_path(s);
+        }
+        if (!loaded) break;
+      }
+    }
+    // Schedule all workloads (a loaded mapping is kept as is)
+    bool succeed = loaded ? true : scheduler->incrementalSchedule(*codesign);
+    if (mapdir && !loaded && succeed) {
+      ENFORCED_SYSTEM(("mkdir -p " + std::string(mapdir)).c_str());
+      for (auto& ws : codesign->workload_array)
+        for (auto& s : ws.sched_array) {
+          s.DumpMappingInJson(mapping_path(s));
+          DSA_INFO << "Saved mapping " << mapping_path(s);
+        }
+    }
     
     // Calculate DSE Objective and Get System Performance Parameters
     auto obj = codesign->dse_obj();

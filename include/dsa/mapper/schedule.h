@@ -801,6 +801,14 @@ class Schedule {
     return _nodeProp[node->id()].slots[slot].vertices;
   }
 
+  /*!
+   * \brief Number of PE registers the instructions mapped on `fu` need (accumulator
+   *        results, register operands, and one free register per immediate operand),
+   *        counting `extra` as if it were mapped there too. The bitstream encoder
+   *        preloads immediates into registers, so this must not exceed regFileSize().
+   */
+  int registerDemand(ssfu* fu, dsa::dfg::Instruction* extra);
+
   std::vector<std::pair<dsa::dfg::Edge*, int>>& dfg_passthroughs_of(int slot, ssnode* node) {
     return _nodeProp[node->id()].slots[slot].passthrus;
   }
